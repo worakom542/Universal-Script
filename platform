@@ -1,0 +1,367 @@
+-- Platform GUI + Controller (LocalScript)
+-- Paste this in a LocalScript under StarterGui (or StarterPlayerScripts)
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+if not player then
+	warn("PlatformController: must be run as a LocalScript (client).")
+	return
+end
+
+-- CONFIG
+local screenGuiName = "PlatformGui"      -- ScreenGui name (will be created if missing)
+local moveDistance = 50                  -- studs
+local moveDuration = 1.5                 -- seconds
+local platformSize = Vector3.new(6,1,6)
+
+-- UI layout config (simple)
+local uiConfig = {
+	width = 200,
+	height = 260,
+	buttonHeight = 36,
+	padding = 8,
+	btnSpacing = 6
+}
+
+-- Runtime variables
+local gui = nil
+local buttons = {}
+local platform = nil
+local highlight = nil
+local isMoving = false
+local fixedY = nil
+local humanoidRootPart = nil
+
+-- Utility logging
+local function log(...)
+	print("[PlatformController]", ...)
+end
+local function warnLog(...)
+	warn("[PlatformController]", ...)
+end
+
+-- Wait for character HRP
+local function waitForCharacter()
+	local char = player.Character or player.CharacterAdded:Wait()
+	humanoidRootPart = char:WaitForChild("HumanoidRootPart", 10)
+	if not humanoidRootPart then
+		warnLog("HumanoidRootPart not found.")
+	else
+		log("Character ready.")
+	end
+end
+waitForCharacter()
+player.CharacterAdded:Connect(waitForCharacter)
+
+-- Create basic ScreenGui and Buttons if not present
+local function createGuiIfMissing()
+	local playerGui = player:WaitForChild("PlayerGui")
+	gui = playerGui:FindFirstChild(screenGuiName)
+	if not gui then
+		gui = Instance.new("ScreenGui")
+		gui.Name = screenGuiName
+		gui.ResetOnSpawn = true
+		gui.Parent = playerGui
+		log("Created ScreenGui:", screenGuiName)
+	else
+		log("Using existing ScreenGui:", gui.Name)
+	end
+
+	-- Main frame
+	local mainFrame = gui:FindFirstChild("PlatformFrame")
+	if not mainFrame then
+		mainFrame = Instance.new("Frame")
+		mainFrame.Name = "PlatformFrame"
+		mainFrame.Size = UDim2.new(0, uiConfig.width, 0, uiConfig.height)
+		mainFrame.Position = UDim2.new(0, 12, 0, 80)
+		mainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+		mainFrame.BorderSizePixel = 0
+		mainFrame.Parent = gui
+
+		local title = Instance.new("TextLabel")
+		title.Name = "Title"
+		title.Size = UDim2.new(1, -16, 0, 28)
+		title.Position = UDim2.new(0, 8, 0, 8)
+		title.BackgroundTransparency = 1
+		title.Text = "Platform Controller"
+		title.TextColor3 = Color3.fromRGB(255,255,255)
+		title.TextScaled = false
+		title.Font = Enum.Font.SourceSansBold
+		title.Parent = mainFrame
+	end
+
+	-- Helper to create a button
+	local function makeButton(name, text, yIndex)
+		local existing = mainFrame:FindFirstChild(name)
+		if existing then
+			buttons[name] = existing
+			return existing
+		end
+		local btn = Instance.new("TextButton")
+		btn.Name = name
+		btn.Size = UDim2.new(1, -16, 0, uiConfig.buttonHeight)
+		btn.Position = UDim2.new(0, 8, 0, 40 + (uiConfig.buttonHeight + uiConfig.btnSpacing) * (yIndex-1))
+		btn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+		btn.BorderSizePixel = 0
+		btn.TextColor3 = Color3.fromRGB(255,255,255)
+		btn.Text = text
+		btn.Font = Enum.Font.SourceSans
+		btn.Parent = mainFrame
+		buttons[name] = btn
+		return btn
+	end
+
+	makeButton("CreatePlatform", "Create Platform", 1)
+	makeButton("Up", "Move Up (temporary)", 2)
+	makeButton("Down", "Move Down (temporary)", 3)
+	makeButton("ResetPos", "Reset Position", 4)
+	makeButton("DeletePlatform", "Delete Platform", 5)
+
+	log("GUI ready with buttons.")
+end
+
+createGuiIfMissing()
+
+-- Platform management
+local function calculateFixedY()
+	if not humanoidRootPart then return nil end
+	-- adjust formula if placement off; this roughly places under feet
+	return humanoidRootPart.Position.Y - humanoidRootPart.Size.Y/0.4 - platformSize.Y/2 - 0.1
+end
+
+local function createPlatform()
+	if platform then
+		platform:Destroy()
+		platform = nil
+		highlight = nil
+	end
+	if not humanoidRootPart then
+		warnLog("Cannot create platform: humanoidRootPart missing.")
+		return
+	end
+
+	platform = Instance.new("Part")
+	platform.Name = "PlayerPlatform"
+	platform.Size = platformSize
+	platform.Anchored = true
+	platform.CanCollide = true
+	platform.Parent = workspace
+
+	fixedY = calculateFixedY()
+	if not fixedY then fixedY = humanoidRootPart.Position.Y - 4 end
+	platform.CFrame = CFrame.new(humanoidRootPart.Position.X, fixedY, humanoidRootPart.Position.Z)
+
+	highlight = Instance.new("Highlight")
+	highlight.Adornee = platform
+	highlight.FillColor = Color3.fromRGB(0, 200, 100)
+	highlight.FillTransparency = 0.6
+	highlight.OutlineTransparency = 0
+	highlight.Parent = platform
+
+	log("Platform created at Y:", fixedY)
+end
+
+local function deletePlatform()
+	if platform then
+		platform:Destroy()
+		platform = nil
+		highlight = nil
+		log("Platform deleted.")
+	else
+		log("No platform to delete.")
+	end
+end
+
+local function resetPlatformPosition()
+	if not platform or not humanoidRootPart or not fixedY then
+		log("Reset skipped: missing platform or character.")
+		return
+	end
+	platform.CFrame = CFrame.new(humanoidRootPart.Position.X, fixedY, humanoidRootPart.Position.Z)
+	log("Platform reset to fixedY.")
+end
+
+-- Movement helpers
+local function movePlatform(deltaYSign)
+	if not platform then
+		warnLog("Move requested but platform missing. Create it first.")
+		return
+	end
+	if isMoving then return end
+	isMoving = true
+	local up = (deltaYSign > 0)
+	log("Starting move", up and "UP" or "DOWN")
+	local startTime = tick()
+	local startY = fixedY
+	local targetY = startY + deltaYSign * moveDistance
+	while tick() - startTime < moveDuration do
+		local alpha = (tick() - startTime) / moveDuration
+		local newY = startY + (targetY - startY) * alpha
+		if humanoidRootPart then
+			local x = humanoidRootPart.Position.X
+			local z = humanoidRootPart.Position.Z
+			platform.CFrame = CFrame.new(x, newY, z) * CFrame.Angles(0, math.rad(humanoidRootPart.Orientation.Y), 0)
+		else
+			platform.CFrame = CFrame.new(platform.Position.X, newY, platform.Position.Z)
+		end
+		RunService.RenderStepped:Wait()
+	end
+
+	-- snap back to original fixedY
+	if humanoidRootPart then
+		platform.CFrame = CFrame.new(humanoidRootPart.Position.X, fixedY, humanoidRootPart.Position.Z) * CFrame.Angles(0, math.rad(humanoidRootPart.Orientation.Y), 0)
+	else
+		platform.CFrame = CFrame.new(platform.Position.X, fixedY, platform.Position.Z)
+	end
+	isMoving = false
+	log("Move finished.")
+end
+
+-- Button connections
+do
+	local createBtn = buttons["CreatePlatform"]
+	local upBtn = buttons["Up"]
+	local downBtn = buttons["Down"]
+	local resetBtn = buttons["ResetPos"]
+	local deleteBtn = buttons["DeletePlatform"]
+
+	if createBtn then
+		createBtn.MouseButton1Click:Connect(function()
+			log("Create clicked")
+			createPlatform()
+		end)
+	end
+	if upBtn then
+		upBtn.MouseButton1Click:Connect(function()
+			log("Up clicked")
+			movePlatform(1) -- positive => up
+		end)
+	end
+	if downBtn then
+		downBtn.MouseButton1Click:Connect(function()
+			log("Down clicked")
+			movePlatform(-1) -- negative => down
+		end)
+	end
+	if resetBtn then
+		resetBtn.MouseButton1Click:Connect(function()
+			log("Reset clicked")
+			resetPlatformPosition()
+		end)
+	end
+	if deleteBtn then
+		deleteBtn.MouseButton1Click:Connect(function()
+			log("Delete clicked")
+			deletePlatform()
+		end)
+	end
+end
+
+-- Auto-create platform at start
+createPlatform()
+
+-- Follow player X,Z and rotation while idle
+RunService.RenderStepped:Connect(function()
+	if platform and not isMoving and humanoidRootPart and fixedY then
+		local pos = Vector3.new(humanoidRootPart.Position.X, fixedY, humanoidRootPart.Position.Z)
+		platform.CFrame = CFrame.new(pos) * CFrame.Angles(0, math.rad(humanoidRootPart.Orientation.Y), 0)
+	end
+end)
+
+--=========================
+-- MAKE GUI DRAGGABLE
+--=========================
+local function MakeDraggable(frame)
+	local UIS = game:GetService("UserInputService")
+	local dragging = false
+	local dragStart
+	local startPos
+
+	frame.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = true
+			dragStart = input.Position
+			startPos = frame.Position
+
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
+
+	frame.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement then
+			if dragging then
+				local delta = input.Position - dragStart
+				frame.Position = UDim2.new(
+					startPos.X.Scale,
+					startPos.X.Offset + delta.X,
+					startPos.Y.Scale,
+					startPos.Y.Offset + delta.Y
+				)
+			end
+		end
+	end)
+end
+
+--=========================
+-- KEYBINDS
+--=========================
+local UserInputService = game:GetService("UserInputService")
+
+-- Keybind mapping: key = function
+local keyActions = {
+	["E"] = function() -- Move Up
+		if not isMoving then
+			movePlatform(1)
+		end
+	end,
+	["C"] = function() -- Move Down
+		if not isMoving then
+			movePlatform(-1)
+		end
+	end,
+	["R"] = function() -- Reset
+		resetPlatformPosition()
+	end,
+	["Z"] = function() -- Create platform
+		createPlatform()
+	end,
+	["X"] = function() -- Delete platform
+		deletePlatform()
+	end,
+	["V"] = function() -- Delete GUI
+		if gui then
+			gui:Destroy()
+			gui = nil
+			log("Platform GUI deleted.")
+		end
+	end,
+}
+
+-- Listen for key input
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end -- ignore if typing in chat/GUI
+	if input.UserInputType == Enum.UserInputType.Keyboard then
+		local key = input.KeyCode.Name
+		local action = keyActions[key]
+		if action then
+			action()
+		end
+	end
+end)
+
+log("Keybinds active: E=Up, C=Down, R=Reset, Z=Create, X=Delete Platform, V=Delete GUI")
+
+
+-- make PlatformFrame draggable
+MakeDraggable(gui.PlatformFrame)
+
+
+log("Platform GUI and Controller loaded.")
+log("GUI ready with buttons.")
+
